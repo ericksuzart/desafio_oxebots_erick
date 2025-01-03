@@ -1,0 +1,15 @@
+# Request
+# available actions
+uint8 MOVE_FORWARD = 0
+uint8 MOVE_BACKWARD = 1
+uint8 TURN_LEFT = 2
+uint8 TURN_RIGHT = 3
+uint8 STOP = 4
+
+uint8 goal_move
+---
+# Result
+bool success
+---
+# Feedback
+float32 percentage_completed
