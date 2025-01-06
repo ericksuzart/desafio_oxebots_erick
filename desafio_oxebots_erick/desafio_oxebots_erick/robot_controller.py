@@ -1,16 +1,24 @@
 import math
-from typing import Any, Optional, Union
 
+import numpy
 import rclpy
+from desafio_oxebots_erick_interfaces.action import MoveBase
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from rclpy.action import ActionClient, ActionServer, CancelResponse, GoalResponse
 from rclpy.node import Node
 from sensor_msgs.msg import Imu, LaserScan
-from std_srvs.srv import SetBool
 from tf_transformations import euler_from_quaternion
 
-from desafio_oxebots_erick_interfaces.action import MoveBase
+# Constants and States definition
+DISTANCE_THRESHOLD = 1.0
+END_POSITION_Y = 10
+
+START = 0
+MOVE_FORWARD = 1
+TURN_LEFT = 2
+TURN_RIGHT = 3
+END = 4
 
 
 class RobotController(Node):
@@ -27,10 +35,11 @@ class RobotController(Node):
 
         # Action client
         self.move_base_client = None
+        self.action_complete = True
 
         # sensor data
-        self.front_distance = 0.0
-        self.left_distance = 0.0
+        self.front_distance = numpy.inf
+        self.left_distance = numpy.inf
         self.linear_velocity = 0.0
         self.angular_velocity = 0.0
 
@@ -47,12 +56,12 @@ class RobotController(Node):
 
         # subscriber for receiving data from the robot
         self.odom_sub = self.create_subscription(
-            Odometry, '/odom', self.odomCallback, qos_profile=10
+            Odometry, '/odom', self.odom_callback, qos_profile=10
         )
         self.laser_sub = self.create_subscription(
-            LaserScan, '/scan', self.laserCallback, qos_profile=10
+            LaserScan, '/scan', self.laser_callback, qos_profile=10
         )
-        self.imu_sub = self.create_subscription(Imu, '/imu', self.imuCallback, qos_profile=10)
+        self.imu_sub = self.create_subscription(Imu, '/imu', self.imu_callback, qos_profile=10)
 
         # publisher to move the robot
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', qos_profile=10)
@@ -62,17 +71,20 @@ class RobotController(Node):
             self,
             MoveBase,
             '/move_base_action',
-            execute_callback=self.moveBaseExecute,
-            goal_callback=self.moveBaseHandleGoal,
-            cancel_callback=self.moveBaseHandleCancel,
-            handle_accepted_callback=self.moveBaseHandleAccepted,
+            execute_callback=self.move_base_execute,
+            goal_callback=self.move_base_handle_goal,
+            cancel_callback=self.move_base_handle_cancel,
+            handle_accepted_callback=self.move_base_handle_accepted,
         )
 
         # action client for sending action goals to move the robot
         self.move_base_client = ActionClient(self, MoveBase, '/move_base_action')
 
-        # timer for repeatedly invoking a callback to publish messages
-        self.timer = self.create_timer(1.0, self.timerCallback)
+        # timer that updates the state machine every 0.1 s
+        self.timer = self.create_timer(0.1, self.state_machine)
+
+        self.current_state = START
+        self.next_state = START
 
         # rate that determines the frequency of the loops
         self.loop_rate = self.create_rate(100, self.get_clock())
@@ -81,7 +93,7 @@ class RobotController(Node):
     # Data processing callbacks
     #
 
-    def odomCallback(self, msg: Odometry):
+    def odom_callback(self, msg: Odometry):
         """Update (x,y) position and yaw orientation from /odom."""
         x = msg.pose.pose.position.x
         y = msg.pose.pose.position.y
@@ -98,12 +110,12 @@ class RobotController(Node):
         self.position = (x, y)
         self.orientation = yaw
 
-    def laserCallback(self, msg: LaserScan):
+    def laser_callback(self, msg: LaserScan):
         """Extract the front and left distances from the laser sensor messages"""
         self.front_distance = msg.ranges[0]
         self.left_distance = msg.ranges[1]
 
-    def imuCallback(self, msg: Imu):
+    def imu_callback(self, msg: Imu):
         """Extract linear/angular velocity from IMU."""
         self.linear_velocity = msg.linear_acceleration.x
         self.angular_velocity = msg.angular_velocity.z
@@ -131,33 +143,27 @@ class RobotController(Node):
         self.publish_cmd_vel(0.0, 0.0)
 
     #
-    # MoveBase Action
+    # Action Server: https://docs.ros.org/en/humble/Tutorials/Intermediate/Writing-an-Action-Server-Client/Py.html
     #
-    def moveBaseHandleGoal(self, goal: MoveBase.Goal) -> GoalResponse:
+    def move_base_handle_goal(self, goal: MoveBase.Goal) -> GoalResponse:
         """Processes action goal requests"""
-        self.get_logger().info('Received MoveBase goal request')
         return GoalResponse.ACCEPT
 
-    def moveBaseHandleCancel(self, goal: MoveBase.Goal) -> CancelResponse:
+    def move_base_handle_cancel(self, goal: MoveBase.Goal) -> CancelResponse:
         """Processes action cancel requests"""
-        self.get_logger().info('Received request to cancel MoveBase goal')
         return CancelResponse.ACCEPT
 
-    def moveBaseHandleAccepted(self, goal: MoveBase.Goal):
+    def move_base_handle_accepted(self, goal: MoveBase.Goal):
         """Processes accepted action goal requests"""
 
         # execute action in a separate thread to avoid blocking
         goal.execute()
 
-    async def moveBaseExecute(self, goal_handle: MoveBase.Goal) -> MoveBase.Result:
+    async def move_base_execute(self, goal_handle: MoveBase.Goal) -> MoveBase.Result:
         """
-        Execute callback for the MoveBase action.
-        This is an *asynchronous* function so we can 'await' inside.
+        Asynchronously executes the MoveBase action goal to move or turn a robot.
         """
-
-        self.get_logger().info('Executing MoveBase goal')
-
-        # Goal is the requested movement (uint8)
+        # Goal is the requested movement
         goal = goal_handle.request
         movement_type = goal.goal_move
 
@@ -168,7 +174,6 @@ class RobotController(Node):
 
         # Stop command: no movement, immediately succeed
         if movement_type == goal.STOP:
-            self.get_logger().info('STOP goal received.')
             self.stop_robot()
             result.success = True
             return result
@@ -184,9 +189,8 @@ class RobotController(Node):
         start_yaw = self.orientation
 
         if movement_type == goal.MOVE_FORWARD:
-            target_distance = 1.0
-        elif movement_type == goal.MOVE_BACKWARD:
-            target_distance = -1.0
+            target_distance = 1.0  # 1 meter
+
         elif movement_type == goal.TURN_LEFT:
             # Snap start_yaw to nearest multiple of pi/2
             snapped_yaw = (math.pi / 2.0) * round(start_yaw / (math.pi / 2.0))
@@ -212,7 +216,6 @@ class RobotController(Node):
         if abs(target_distance) > 0:
             # We are moving forward/backward
             distance_to_travel = abs(target_distance)
-            direction = 1.0 if target_distance > 0 else -1.0
 
             while rclpy.ok():
                 # Check if the goal was canceled
@@ -232,13 +235,10 @@ class RobotController(Node):
 
                 # If front distance is at or below 0.5 m, stop moving
                 if self.front_distance <= 0.5:
-                    self.get_logger().info(
-                        f'Front obstacle detected at {self.front_distance:.2f} m. Stopping forward motion.'
-                    )
                     break
 
                 # Publish velocity commands to move the robot
-                self.publish_cmd_vel(direction * linear_speed, 0.0)
+                self.publish_cmd_vel(linear_speed, 0.0)
 
                 # Provide some feedback for the action
                 progress = min(traveled / distance_to_travel, 1.0)
@@ -304,13 +304,89 @@ class RobotController(Node):
         # If we made it this far, we consider the action succeeded
         result.success = True
         goal_handle.succeed()
-        self.get_logger().info('Goal succeeded')
 
         return result
 
-    def timerCallback(self):
-        """Processes timer triggers"""
-        self.get_logger().info('Timer triggered')
+    #
+    # Action Client: https://docs.ros.org/en/humble/Tutorials/Intermediate/Writing-an-Action-Server-Client/Py.html
+    #
+    def send_move_goal(self, goal: MoveBase.Goal):
+        """Send a goal to the MoveBase action server."""
+        self.action_complete = False
+        self.move_base_client.wait_for_server()
+        self._send_goal_future = self.move_base_client.send_goal_async(
+            goal, feedback_callback=self.move_base_feedback_callback
+        )
+        self._send_goal_future.add_done_callback(self.move_base_goal_response_callback)
+
+    def move_base_goal_response_callback(self, future):
+        """Callback for goal response."""
+        goal_handle = future.result()
+
+        if not goal_handle.accepted:
+            return
+
+        self._get_result_future = goal_handle.get_result_async()
+        self._get_result_future.add_done_callback(self.move_base_get_result_callback)
+
+    def move_base_get_result_callback(self, future):
+        """Callback for getting the result."""
+        result = future.result().result
+        if result.success:
+            self.action_complete = True
+
+    def move_base_feedback_callback(self, feedback_msg: MoveBase.Feedback):
+        """Callback for feedback."""
+        pass
+
+    def state_machine(self):
+        """State machine to control the robot based on Hand On Wall algorithm"""
+
+        if not self.action_complete or self.current_state == END:
+            return
+
+        # State transitions
+        if self.position[1] >= END_POSITION_Y:
+            self.next_state = END
+
+        elif self.current_state == START:
+            if self.front_distance > DISTANCE_THRESHOLD:
+                self.next_state = START
+            else:
+                self.next_state = TURN_RIGHT
+
+        elif self.current_state == TURN_RIGHT or self.current_state == TURN_LEFT:
+            self.next_state = MOVE_FORWARD
+
+        elif self.current_state == MOVE_FORWARD:
+            if self.left_distance > DISTANCE_THRESHOLD:
+                self.next_state = TURN_LEFT
+            elif self.front_distance <= DISTANCE_THRESHOLD:
+                self.next_state = TURN_RIGHT
+            else:
+                self.next_state = MOVE_FORWARD
+
+        elif self.current_state == END:
+            self.next_state = END
+
+        # State actions
+        if self.next_state == START:
+            self.get_logger().info('Starting the maze navigation.')
+            self.send_move_goal(MoveBase.Goal(goal_move=MoveBase.Goal.MOVE_FORWARD))
+        elif self.next_state == TURN_RIGHT:
+            self.get_logger().info('Turning right.')
+            self.send_move_goal(MoveBase.Goal(goal_move=MoveBase.Goal.TURN_RIGHT))
+        elif self.next_state == TURN_LEFT:
+            self.get_logger().info('Turning left.')
+            self.send_move_goal(MoveBase.Goal(goal_move=MoveBase.Goal.TURN_LEFT))
+        elif self.next_state == MOVE_FORWARD:
+            self.get_logger().info('Moving forward.')
+            self.send_move_goal(MoveBase.Goal(goal_move=MoveBase.Goal.MOVE_FORWARD))
+        elif self.next_state == END:
+            self.get_logger().info('Ending the maze navigation.')
+            self.send_move_goal(MoveBase.Goal(goal_move=MoveBase.Goal.STOP))
+
+        self.current_state = self.next_state
 
 
 def main():
