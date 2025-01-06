@@ -11,8 +11,10 @@ from sensor_msgs.msg import Imu, LaserScan
 from tf_transformations import euler_from_quaternion
 
 # Constants and States definition
-DISTANCE_THRESHOLD = 1.0
-END_POSITION_Y = 10
+DISTANCE_THRESHOLD = 1.0 # meters
+END_POSITION_Y = 10 # meters
+TB3_MAX_LIN_VEL = 0.1 # m/s
+TB3_MAX_ANG_VEL = 1.0 # rad/s
 
 START = 0
 MOVE_FORWARD = 1
@@ -161,151 +163,103 @@ class RobotController(Node):
 
     async def move_base_execute(self, goal_handle: MoveBase.Goal) -> MoveBase.Result:
         """
-        Asynchronously executes the MoveBase action goal to move or turn a robot.
-        """
-        # Goal is the requested movement
-        goal = goal_handle.request
-        movement_type = goal.goal_move
+        Executes robot motion commands based on the goal parameter.
 
-        # Prepare the result and feedback message
+        This function checks the requested motion goal and performs the appropriate action:
+        - STOP: Halts the robot’s movement.
+        - MOVE_FORWARD: Moves the robot forward a fixed distance.
+        - TURN_LEFT or TURN_RIGHT: Rotates the robot in place to the nearest 90° multiple,
+            left or right.
+        """
+        goal = goal_handle.request
         result = MoveBase.Result()
         feedback = MoveBase.Feedback()
         feedback.percentage_completed = 0.0
 
-        # Stop command: no movement, immediately succeed
-        if movement_type == goal.STOP:
+        if goal.goal_move == goal.STOP:
             self.stop_robot()
             result.success = True
             return result
 
-        # Depending on forward/backward or left/right, we define:
-        #   - target_distance (in meters), or
-        #   - target_angle (in radians).
-        target_distance = 0.0
-        target_angle = 0.0
-
-        # Save initial state so we can figure out how far/angle we've moved
-        start_x, start_y = self.position
-        start_yaw = self.orientation
-
-        if movement_type == goal.MOVE_FORWARD:
-            target_distance = 1.0  # 1 meter
-
-        elif movement_type == goal.TURN_LEFT:
-            # Snap start_yaw to nearest multiple of pi/2
+        if goal.goal_move == goal.MOVE_FORWARD:
+            success = await self.move_forward(goal_handle, 1.0, feedback)
+        else:
+            # TURN_LEFT or TURN_RIGHT
+            start_yaw = self.orientation
             snapped_yaw = (math.pi / 2.0) * round(start_yaw / (math.pi / 2.0))
-            # Turn left by pi/2
-            final_yaw = snapped_yaw + math.pi / 2.0
-            # Compute the actual angle difference we must turn
+            delta = math.pi / 2.0 if goal.goal_move == goal.TURN_LEFT else -math.pi / 2.0
+            final_yaw = snapped_yaw + delta
             target_angle = self.angle_diff(final_yaw, start_yaw)
+            success = await self.rotate_in_place(goal_handle, target_angle, feedback)
 
-        elif movement_type == goal.TURN_RIGHT:
-            # Snap start_yaw to nearest multiple of pi/2
-            snapped_yaw = (math.pi / 2.0) * round(start_yaw / (math.pi / 2.0))
-            # Turn right by pi/2
-            final_yaw = snapped_yaw - math.pi / 2.0
-            # Compute the actual angle difference we must turn
-            target_angle = self.angle_diff(final_yaw, start_yaw)
-
-        # Define the speed for the robot to move
-        linear_speed = 0.1  # m/s
-        max_angular_speed = 0.5  # rad/s
-
-        # Decide if we are moving straight or turning
-        # Use a small loop to move until close to target
-        if abs(target_distance) > 0:
-            # We are moving forward/backward
-            distance_to_travel = abs(target_distance)
-
-            while rclpy.ok():
-                # Check if the goal was canceled
-                if goal_handle.is_cancel_requested:
-                    self.stop_robot()
-                    result.success = False
-                    goal_handle.canceled()
-                    self.get_logger().info('MoveBase canceled (distance).')
-                    return result
-
-                current_x, current_y = self.position
-                traveled = math.sqrt((current_x - start_x) ** 2 + (current_y - start_y) ** 2)
-
-                # If we've traveled the required distance, break
-                if traveled >= distance_to_travel:
-                    break
-
-                # If front distance is at or below 0.5 m, stop moving
-                if self.front_distance <= 0.5:
-                    break
-
-                # Publish velocity commands to move the robot
-                self.publish_cmd_vel(linear_speed, 0.0)
-
-                # Provide some feedback for the action
-                progress = min(traveled / distance_to_travel, 1.0)
-                feedback.percentage_completed = progress * 100.0
-                goal_handle.publish_feedback(feedback)
-
-                # Sleep for a short time
-                self.loop_rate.sleep()
-
-            # Stop the robot once the distance is reached or we are blocked
-            self.stop_robot()
-
-        elif abs(target_angle) > 0:
-            # Desired final yaw
-            goal_yaw = self.normalize_angle(start_yaw + target_angle)
-
-            # A simple P-controller gain for turning
-            Kp = 0.8
-
-            # We will break once error < tolerance
-            angle_tolerance = 0.01  # rad (~ 0.57°)
-
-            # Loop until we are within the tolerance
-            while rclpy.ok():
-                # Check if the goal was canceled
-                if goal_handle.is_cancel_requested:
-                    self.stop_robot()
-                    result.success = False
-                    goal_handle.canceled()
-                    self.get_logger().info('MoveBase canceled (angle).')
-                    return result
-
-                # Current error
-                error = self.angle_diff(goal_yaw, self.orientation)
-
-                # Are we close enough?
-                if abs(error) < angle_tolerance:
-                    break
-
-                # P-controller for angular velocity
-                ang_vel = Kp * error
-
-                # Clamp the speed to avoid going too fast
-                ang_vel = max(min(ang_vel, max_angular_speed), -max_angular_speed)
-
-                # Publish velocity commands to turn the robot
-                self.publish_cmd_vel(0.0, ang_vel)
-
-                # Provide some feedback
-                turned_so_far = self.angle_diff(self.orientation, start_yaw)
-                progress = (
-                    abs(turned_so_far / target_angle) if target_angle != 0 else 0.0
-                )  # avoid division by zero
-                feedback.percentage_completed = min(progress, 1.0) * 100.0
-                goal_handle.publish_feedback(feedback)
-
-                # Sleep for a short time
-                self.loop_rate.sleep()
-
-            # Stop the robot once the angle is reached
-            self.stop_robot()
-
-        # If we made it this far, we consider the action succeeded
-        result.success = True
-        goal_handle.succeed()
-
+        result.success = success
+        if success:
+            goal_handle.succeed()
+        else:
+            goal_handle.canceled()
         return result
+
+    async def move_forward(self, goal_handle, target_distance, feedback):
+        """
+        Asynchronously moves the robot forward until the specified distance is traveled or
+        an obstacle is detected within a safe range.
+        """
+        start_x, start_y = self.position
+        distance_to_travel = abs(target_distance)
+        linear_speed = TB3_MAX_LIN_VEL
+
+        while rclpy.ok():
+            if goal_handle.is_cancel_requested:
+                self.stop_robot()
+                return False
+
+            current_x, current_y = self.position
+            traveled = math.sqrt((current_x - start_x) ** 2 + (current_y - start_y) ** 2)
+
+            if traveled >= distance_to_travel or self.front_distance <= 0.5:
+                break
+
+            self.publish_cmd_vel(linear_speed, 0.0)
+            feedback.percentage_completed = min(traveled / distance_to_travel, 1.0) * 100.0
+            goal_handle.publish_feedback(feedback)
+            self.loop_rate.sleep()
+
+        self.stop_robot()
+        return True
+
+    async def rotate_in_place(self, goal_handle, target_angle, feedback):
+        """
+        Asynchronously rotates the robot in place until the current yaw angle reaches the given
+        target yaw angle within a specified tolerance.
+        """
+        start_yaw = self.orientation
+        goal_yaw = self.normalize_angle(start_yaw + target_angle)
+        Kp = 0.8
+        angle_tolerance = 0.01
+        max_angular_speed = TB3_MAX_ANG_VEL
+
+        while rclpy.ok():
+            if goal_handle.is_cancel_requested:
+                self.stop_robot()
+                return False
+
+            error = self.angle_diff(goal_yaw, self.orientation)
+
+            if abs(error) < angle_tolerance:
+                break
+
+            ang_vel = Kp * error
+            ang_vel = max(min(ang_vel, max_angular_speed), -max_angular_speed)
+            self.publish_cmd_vel(0.0, ang_vel)
+
+            turned = self.angle_diff(self.orientation, start_yaw)
+            progress = abs(turned / target_angle) if target_angle else 0.0
+            feedback.percentage_completed = min(progress, 1.0) * 100.0
+            goal_handle.publish_feedback(feedback)
+            self.loop_rate.sleep()
+
+        self.stop_robot()
+        return True
 
     #
     # Action Client: https://docs.ros.org/en/humble/Tutorials/Intermediate/Writing-an-Action-Server-Client/Py.html
