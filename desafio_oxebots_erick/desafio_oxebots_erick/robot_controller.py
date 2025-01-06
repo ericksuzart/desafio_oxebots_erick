@@ -13,8 +13,8 @@ from tf_transformations import euler_from_quaternion
 # Constants and States definition
 DISTANCE_THRESHOLD = 1.0 # meters
 END_POSITION_Y = 10 # meters
-TB3_MAX_LIN_VEL = 0.1 # m/s
-TB3_MAX_ANG_VEL = 1.0 # rad/s
+TB3_MAX_LIN_VEL = 0.3 # m/s
+TB3_MAX_ANG_VEL = 3.0 # rad/s
 
 START = 0
 MOVE_FORWARD = 1
@@ -42,12 +42,11 @@ class RobotController(Node):
         # sensor data
         self.front_distance = numpy.inf
         self.left_distance = numpy.inf
-        self.linear_velocity = 0.0
-        self.angular_velocity = 0.0
 
         # robot state
         self.position = (0.0, 0.0)
         self.orientation = 0.0
+        self.current_speed = 0.0
 
         self.setup()
 
@@ -63,7 +62,6 @@ class RobotController(Node):
         self.laser_sub = self.create_subscription(
             LaserScan, '/scan', self.laser_callback, qos_profile=10
         )
-        self.imu_sub = self.create_subscription(Imu, '/imu', self.imu_callback, qos_profile=10)
 
         # publisher to move the robot
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', qos_profile=10)
@@ -117,11 +115,6 @@ class RobotController(Node):
         self.front_distance = msg.ranges[0]
         self.left_distance = msg.ranges[1]
 
-    def imu_callback(self, msg: Imu):
-        """Extract linear/angular velocity from IMU."""
-        self.linear_velocity = msg.linear_acceleration.x
-        self.angular_velocity = msg.angular_velocity.z
-
     #
     # Helper methods
     #
@@ -142,6 +135,7 @@ class RobotController(Node):
 
     def stop_robot(self):
         """Stop the robot by publishing zero velocities."""
+        self.current_speed = 0.0
         self.publish_cmd_vel(0.0, 0.0)
 
     #
@@ -201,12 +195,12 @@ class RobotController(Node):
 
     async def move_forward(self, goal_handle, target_distance, feedback):
         """
-        Asynchronously moves the robot forward until the specified distance is traveled or
-        an obstacle is detected within a safe range.
+        Asynchronously moves the robot forward with an acceleration ramp until the specified distance is traveled
+        or an obstacle is detected within a safe range.
         """
         start_x, start_y = self.position
         distance_to_travel = abs(target_distance)
-        linear_speed = TB3_MAX_LIN_VEL
+        acceleration = 0.1  # m/s²
 
         while rclpy.ok():
             if goal_handle.is_cancel_requested:
@@ -219,12 +213,16 @@ class RobotController(Node):
             if traveled >= distance_to_travel or self.front_distance <= 0.5:
                 break
 
-            self.publish_cmd_vel(linear_speed, 0.0)
+            # Accelerate
+            if self.current_speed < TB3_MAX_LIN_VEL:
+                self.current_speed += acceleration * 0.01  # Assuming loop runs at 100 Hz
+                self.current_speed = min(self.current_speed, TB3_MAX_LIN_VEL)
+
+            self.publish_cmd_vel(self.current_speed, 0.0)
             feedback.percentage_completed = min(traveled / distance_to_travel, 1.0) * 100.0
             goal_handle.publish_feedback(feedback)
             self.loop_rate.sleep()
 
-        self.stop_robot()
         return True
 
     async def rotate_in_place(self, goal_handle, target_angle, feedback):
@@ -237,6 +235,8 @@ class RobotController(Node):
         Kp = 0.8
         angle_tolerance = 0.01
         max_angular_speed = TB3_MAX_ANG_VEL
+
+        self.stop_robot()
 
         while rclpy.ok():
             if goal_handle.is_cancel_requested:
