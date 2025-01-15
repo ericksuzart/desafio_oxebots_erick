@@ -1,5 +1,5 @@
-from glob import glob
 import os
+from glob import glob
 
 from setuptools import setup
 
@@ -7,7 +7,7 @@ package_name = 'desafio_oxebots_erick'
 
 setup(
     name=package_name,
-    version='0.0.0',
+    version='1.0.0',
     packages=[package_name],
     data_files=[
         ('share/ament_index/resource_index/packages', ['resource/' + package_name]),
@@ -17,12 +17,14 @@ setup(
     ],
     install_requires=['setuptools'],
     zip_safe=True,
-    maintainer='root',
-    maintainer_email='root@todo.todo',
-    description='TODO: Package description',
-    license='TODO: License declaration',
+    maintainer='Erick Suzart',
+    maintainer_email='erick.suzart@ufba.br',
+    description='Desafio OxeBots - Hands On Wall Follower',
+    license='GPL-3.0-only',
     tests_require=['pytest'],
     entry_points={
-        'console_scripts': ['robot_controller = desafio_oxebots_erick.robot_controller:main'],
+        'console_scripts': [
+            'robot_controller = desafio_oxebots_erick.robot_controller:main',
+        ],
     },
 )

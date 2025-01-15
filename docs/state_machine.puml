@@ -5,11 +5,11 @@ hide empty description
 ' Initial pseudo-state
 [*] --> START
 
-' Global transition to END if position[1] >= END_POSITION_Y
-START -[#red]-> END : <color:red>position[1] >= END_POSITION_Y</color>
-TURN_RIGHT -[#red]-> END : <color:red>position[1] >= END_POSITION_Y</color>
-TURN_LEFT -[#red]-> END : <color:red>position[1] >= END_POSITION_Y</color>
-MOVE_FORWARD -[#red]-> END : <color:red>position[1] >= END_POSITION_Y</color>
+' Global transition to END if y >= END_POSITION_Y
+START -[#red]-> END : <color:red>y >= END_POSITION_Y</color>
+TURN_RIGHT -[#red]-> END : <color:red>y >= END_POSITION_Y</color>
+TURN_LEFT -[#red]-> END : <color:red>y >= END_POSITION_Y</color>
+MOVE_FORWARD -[#red]-> END : <color:red>y >= END_POSITION_Y</color>
 
 ' START state transitions
 START --> START : front_distance > DISTANCE_THRESHOLD

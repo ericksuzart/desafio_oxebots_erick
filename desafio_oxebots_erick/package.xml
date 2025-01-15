@@ -4,20 +4,21 @@
 
   <name>desafio_oxebots_erick</name>
   <version>0.0.0</version>
-  <description>TODO</description>
+  <description>Desafio OxeBots - Hands On Wall Follower</description>
 
   <maintainer email="erick.suzart@ufba.br">Erick Suzart</maintainer>
   <author email="erick.suzart@ufba.br">Erick Suzart</author>
 
   <license>GPL-3.0-only</license>
 
+  <depend>desafio_oxebots_erick_interfaces</depend>
   <depend>rclpy</depend>
   <depend>std_msgs</depend>
   <depend>std_srvs</depend>
-  <depend>desafio_oxebots_erick_interfaces</depend>
+
+  <exec_depend>desafio_oxebots</exec_depend>
 
   <export>
     <build_type>ament_python</build_type>
   </export>
-
 </package>

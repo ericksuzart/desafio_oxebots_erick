@@ -1,4 +1,5 @@
 import math
+from enum import Enum
 
 import numpy
 import rclpy
@@ -7,25 +8,35 @@ from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from rclpy.action import ActionClient, ActionServer, CancelResponse, GoalResponse
 from rclpy.node import Node
-from sensor_msgs.msg import Imu, LaserScan
+from sensor_msgs.msg import LaserScan
 from tf_transformations import euler_from_quaternion
 
-# Constants and States definition
-DISTANCE_THRESHOLD = 1.0 # meters
-END_POSITION_Y = 10 # meters
-TB3_MAX_LIN_VEL = 0.3 # m/s
-TB3_MAX_ANG_VEL = 3.0 # rad/s
 
-START = 0
-MOVE_FORWARD = 1
-TURN_LEFT = 2
-TURN_RIGHT = 3
-END = 4
+class FSM_state(Enum):
+    START = 0
+    MOVE_FORWARD = 1
+    TURN_LEFT = 2
+    TURN_RIGHT = 3
+    END = 4
 
 
 class RobotController(Node):
     def __init__(self):
         super().__init__('robot_controller')
+
+        # Declare ROS 2 parameters for configurable constants
+        self.declare_parameter('distance_threshold', 1.0)
+        self.declare_parameter('end_position_y', 10.0)
+        self.declare_parameter('bot_max_lin_vel', 1.0)
+        self.declare_parameter('bot_max_ang_vel', 3.0)
+        self.declare_parameter('update_frequency', 100)
+
+        # Retrieve parameter values
+        self.distance_threshold = self.get_parameter('distance_threshold').value
+        self.end_position_y = self.get_parameter('end_position_y').value
+        self.bot_max_lin_vel = self.get_parameter('bot_max_lin_vel').value
+        self.bot_max_ang_vel = self.get_parameter('bot_max_ang_vel').value
+        self.update_frequency = self.get_parameter('update_frequency').value
 
         # Subscribers
         self.odom_sub = None
@@ -47,6 +58,16 @@ class RobotController(Node):
         self.position = (0.0, 0.0)
         self.orientation = 0.0
         self.current_speed = 0.0
+
+        # state machine
+
+        self.STATE_ACTION = {
+            FSM_state.START: ('Starting the maze navigation.', MoveBase.Goal.MOVE_FORWARD),
+            FSM_state.TURN_RIGHT: ('Turning right.', MoveBase.Goal.TURN_RIGHT),
+            FSM_state.TURN_LEFT: ('Turning left.', MoveBase.Goal.TURN_LEFT),
+            FSM_state.MOVE_FORWARD: ('Moving forward.', MoveBase.Goal.MOVE_FORWARD),
+            FSM_state.END: ('Ending the maze navigation.', MoveBase.Goal.STOP),
+        }
 
         self.setup()
 
@@ -81,18 +102,17 @@ class RobotController(Node):
         self.move_base_client = ActionClient(self, MoveBase, '/move_base_action')
 
         # timer that updates the state machine every 0.1 s
-        self.timer = self.create_timer(0.1, self.state_machine)
+        self.timer = self.create_timer(1 / self.update_frequency, self.state_machine)
 
-        self.current_state = START
-        self.next_state = START
+        self.current_state = FSM_state.START
+        self.next_state = FSM_state.MOVE_FORWARD
 
         # rate that determines the frequency of the loops
-        self.loop_rate = self.create_rate(100, self.get_clock())
+        self.loop_rate = self.create_rate(self.update_frequency, self.get_clock())
 
     #
     # Data processing callbacks
     #
-
     def odom_callback(self, msg: Odometry):
         """Update (x,y) position and yaw orientation from /odom."""
         x = msg.pose.pose.position.x
@@ -151,8 +171,6 @@ class RobotController(Node):
 
     def move_base_handle_accepted(self, goal: MoveBase.Goal):
         """Processes accepted action goal requests"""
-
-        # execute action in a separate thread to avoid blocking
         goal.execute()
 
     async def move_base_execute(self, goal_handle: MoveBase.Goal) -> MoveBase.Result:
@@ -176,15 +194,9 @@ class RobotController(Node):
             return result
 
         if goal.goal_move == goal.MOVE_FORWARD:
-            success = await self.move_forward(goal_handle, 1.0, feedback)
+            success = await self.move_forward(goal_handle, feedback)
         else:
-            # TURN_LEFT or TURN_RIGHT
-            start_yaw = self.orientation
-            snapped_yaw = (math.pi / 2.0) * round(start_yaw / (math.pi / 2.0))
-            delta = math.pi / 2.0 if goal.goal_move == goal.TURN_LEFT else -math.pi / 2.0
-            final_yaw = snapped_yaw + delta
-            target_angle = self.angle_diff(final_yaw, start_yaw)
-            success = await self.rotate_in_place(goal_handle, target_angle, feedback)
+            success = await self.rotate_in_place(goal_handle, feedback)
 
         result.success = success
         if success:
@@ -193,13 +205,13 @@ class RobotController(Node):
             goal_handle.canceled()
         return result
 
-    async def move_forward(self, goal_handle, target_distance, feedback):
+    async def move_forward(self, goal_handle, feedback):
         """
-        Asynchronously moves the robot forward with an acceleration ramp until the specified distance is traveled
+        Moves the robot forward with an acceleration ramp until the specified distance is traveled
         or an obstacle is detected within a safe range.
         """
         start_x, start_y = self.position
-        distance_to_travel = abs(target_distance)
+        distance_to_travel = 1.0  # meters
         acceleration = 0.1  # m/s²
 
         while rclpy.ok():
@@ -210,13 +222,13 @@ class RobotController(Node):
             current_x, current_y = self.position
             traveled = math.sqrt((current_x - start_x) ** 2 + (current_y - start_y) ** 2)
 
-            if traveled >= distance_to_travel or self.front_distance <= 0.5:
+            if traveled >= distance_to_travel or self.front_distance <= self.distance_threshold / 2:
                 break
 
             # Accelerate
-            if self.current_speed < TB3_MAX_LIN_VEL:
-                self.current_speed += acceleration * 0.01  # Assuming loop runs at 100 Hz
-                self.current_speed = min(self.current_speed, TB3_MAX_LIN_VEL)
+            if self.current_speed < self.bot_max_lin_vel:
+                self.current_speed += acceleration * 0.01
+                self.current_speed = min(self.current_speed, self.bot_max_lin_vel)
 
             self.publish_cmd_vel(self.current_speed, 0.0)
             feedback.percentage_completed = min(traveled / distance_to_travel, 1.0) * 100.0
@@ -225,16 +237,20 @@ class RobotController(Node):
 
         return True
 
-    async def rotate_in_place(self, goal_handle, target_angle, feedback):
+    async def rotate_in_place(self, goal_handle, feedback):
         """
-        Asynchronously rotates the robot in place until the current yaw angle reaches the given
-        target yaw angle within a specified tolerance.
+        Rotates the robot in place until the current yaw angle reaches the given target yaw angle
+        within a specified tolerance.
         """
         start_yaw = self.orientation
+        goal = goal_handle.request
+
+        snapped_yaw = (math.pi / 2.0) * round(start_yaw / (math.pi / 2.0))
+        delta = math.pi / 2.0 if goal.goal_move == goal.TURN_LEFT else -math.pi / 2.0
+        target_angle = self.angle_diff(snapped_yaw + delta, start_yaw)
         goal_yaw = self.normalize_angle(start_yaw + target_angle)
-        Kp = 0.8
-        angle_tolerance = 0.01
-        max_angular_speed = TB3_MAX_ANG_VEL
+        KP = 0.8
+        ANGLE_TOLERANCE = 0.01
 
         self.stop_robot()
 
@@ -245,11 +261,11 @@ class RobotController(Node):
 
             error = self.angle_diff(goal_yaw, self.orientation)
 
-            if abs(error) < angle_tolerance:
+            if abs(error) < ANGLE_TOLERANCE:
                 break
 
-            ang_vel = Kp * error
-            ang_vel = max(min(ang_vel, max_angular_speed), -max_angular_speed)
+            ang_vel = KP * error
+            ang_vel = max(min(ang_vel, self.bot_max_ang_vel), -self.bot_max_ang_vel)
             self.publish_cmd_vel(0.0, ang_vel)
 
             turned = self.angle_diff(self.orientation, start_yaw)
@@ -285,8 +301,7 @@ class RobotController(Node):
 
     def move_base_get_result_callback(self, future):
         """Callback for getting the result."""
-        result = future.result().result
-        if result.success:
+        if future.result().result.success:
             self.action_complete = True
 
     def move_base_feedback_callback(self, feedback_msg: MoveBase.Feedback):
@@ -295,52 +310,54 @@ class RobotController(Node):
 
     def state_machine(self):
         """State machine to control the robot based on Hand On Wall algorithm"""
+        if not self.should_execute_state_machine():
+            return
+        self.update_next_state()
+        self.execute_state_action()
+        self.current_state = self.next_state
 
-        if not self.action_complete or self.current_state == END:
+    def should_execute_state_machine(self):
+        return self.action_complete and self.current_state != FSM_state.END
+
+    def update_next_state(self):
+        """
+        Updates the robot's next state based on its current position and sensor readings. Determines
+        whether to end, start, turn, or move forward depending on sensor thresholds and the robot's
+        current state.
+        """
+        x, y = self.position
+        if y >= self.end_position_y:
+            self.next_state = FSM_state.END
             return
 
-        # State transitions
-        if self.position[1] >= END_POSITION_Y:
-            self.next_state = END
-
-        elif self.current_state == START:
-            if self.front_distance > DISTANCE_THRESHOLD:
-                self.next_state = START
+        # Some states have almost identical transitions
+        if self.current_state == FSM_state.START:
+            if self.front_distance > self.distance_threshold:
+                self.next_state = FSM_state.START
             else:
-                self.next_state = TURN_RIGHT
+                self.next_state = FSM_state.TURN_RIGHT
+            return
 
-        elif self.current_state == TURN_RIGHT or self.current_state == TURN_LEFT:
-            self.next_state = MOVE_FORWARD
+        if self.current_state in (FSM_state.TURN_RIGHT, FSM_state.TURN_LEFT):
+            self.next_state = FSM_state.MOVE_FORWARD
+            return
 
-        elif self.current_state == MOVE_FORWARD:
-            if self.left_distance > DISTANCE_THRESHOLD:
-                self.next_state = TURN_LEFT
-            elif self.front_distance <= DISTANCE_THRESHOLD:
-                self.next_state = TURN_RIGHT
+        if self.current_state == FSM_state.MOVE_FORWARD:
+            if self.left_distance > self.distance_threshold:
+                self.next_state = FSM_state.TURN_LEFT
+            elif self.front_distance <= self.distance_threshold:
+                self.next_state = FSM_state.TURN_RIGHT
             else:
-                self.next_state = MOVE_FORWARD
+                self.next_state = FSM_state.MOVE_FORWARD
+            return
 
-        elif self.current_state == END:
-            self.next_state = END
+        if self.current_state == FSM_state.END:
+            self.next_state = FSM_state.END
 
-        # State actions
-        if self.next_state == START:
-            self.get_logger().info('Starting the maze navigation.')
-            self.send_move_goal(MoveBase.Goal(goal_move=MoveBase.Goal.MOVE_FORWARD))
-        elif self.next_state == TURN_RIGHT:
-            self.get_logger().info('Turning right.')
-            self.send_move_goal(MoveBase.Goal(goal_move=MoveBase.Goal.TURN_RIGHT))
-        elif self.next_state == TURN_LEFT:
-            self.get_logger().info('Turning left.')
-            self.send_move_goal(MoveBase.Goal(goal_move=MoveBase.Goal.TURN_LEFT))
-        elif self.next_state == MOVE_FORWARD:
-            self.get_logger().info('Moving forward.')
-            self.send_move_goal(MoveBase.Goal(goal_move=MoveBase.Goal.MOVE_FORWARD))
-        elif self.next_state == END:
-            self.get_logger().info('Ending the maze navigation.')
-            self.send_move_goal(MoveBase.Goal(goal_move=MoveBase.Goal.STOP))
-
-        self.current_state = self.next_state
+    def execute_state_action(self):
+        log_message, goal_move = self.STATE_ACTION[self.next_state]
+        self.get_logger().info(log_message)
+        self.send_move_goal(MoveBase.Goal(goal_move=goal_move))
 
 
 def main():
