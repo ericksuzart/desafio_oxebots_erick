@@ -10,11 +10,10 @@ O robô foi programado com uma máquina de estados finitos para seguir a parede 
 
 O projeto foi desenvolvido puramente em Python na forma de dois pacotes, [desafio_oxebots_erick](./desafio_oxebots_erick) e [`desafio_oxebots_erick_interfaces`](./desafio_oxebots_erick_interfaces). O primeiro contém o código do robô e o segundo contém a definição da interface utilizada para a comunicação entre os nós.
 
-<video src="https://github.com/ericksuzart/desafio_oxebots_erick/raw/main/docs/solving.mp4" 
-       controls="controls" 
-       style="max-width: 100%;">
-  Your browser does not support the <code>video</code> element.
-</video>
+Abaixo um vídeo com a resolução do labirínto:
+
+https://github.com/user-attachments/assets/21cb3346-6552-4d57-b956-3d672a0fa356
+
 
 ## Licença
 
